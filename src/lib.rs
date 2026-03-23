@@ -7,6 +7,7 @@ use std::fs;
 use lb_core::mantle::ops::channel::ChannelId;
 use lb_key_management_system_service::keys::Ed25519Key;
 use logos_blockchain_zone_sdk::sequencer::{ZoneSequencer, SequencerCheckpoint};
+use logos_blockchain_zone_sdk::indexer::ZoneIndexer;
 use reqwest::Url;
 use tokio::runtime::Runtime;
 
@@ -122,7 +123,63 @@ fn zone_publish_inner(
     CString::new(result).ok()
 }
 
-/// Free a string returned by zone_publish.
+/// Query inscriptions from a zone channel.
+///
+/// - node_url: HTTP endpoint e.g. "http://192.168.0.209:8080"
+/// - channel_id_hex: 64-char hex channel ID (32 bytes)
+/// - limit: max number of inscriptions to return
+///
+/// Returns JSON array string: [{"id":"hex","data":"text"}, ...]
+/// or NULL on error. Caller must free with zone_free_string().
+#[no_mangle]
+pub extern "C" fn zone_query_channel(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| zone_query_channel_inner(node_url, channel_id_hex, limit));
+    match result {
+        Ok(Some(s)) => s.into_raw(),
+        Ok(None) => { eprintln!("zone_query_channel: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_query_channel: panicked: {:?}", e); std::ptr::null_mut() }
+    }
+}
+
+fn zone_query_channel_inner(
+    node_url: *const c_char,
+    channel_id_hex: *const c_char,
+    limit: i32,
+) -> Option<CString> {
+    if node_url.is_null() || channel_id_hex.is_null() {
+        eprintln!("zone_query_channel: null argument");
+        return None;
+    }
+
+    let node_url_str = unsafe { CStr::from_ptr(node_url) }.to_str().ok()?;
+    let channel_id_hex_str = unsafe { CStr::from_ptr(channel_id_hex) }.to_str().ok()?;
+
+    let channel_id = ChannelId::from(<[u8; 32]>::try_from(hex::decode(channel_id_hex_str).ok()?).ok()?);
+    let url: Url = node_url_str.parse().ok()?;
+    let indexer = ZoneIndexer::new(channel_id, url, None);
+
+    eprintln!("zone_query_channel: channel={} limit={}", channel_id_hex_str, limit);
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let poll = indexer.next_messages(None, limit as usize).await.ok()?;
+        let items: Vec<serde_json::Value> = poll.messages.iter().map(|b| {
+            serde_json::json!({
+                "id": hex::encode(<[u8; 32]>::from(b.id)),
+                "data": String::from_utf8_lossy(&b.data).to_string()
+            })
+        }).collect();
+        Some(serde_json::to_string(&items).ok()?)
+    })?;
+
+    CString::new(result).ok()
+}
+
+/// Free a string returned by zone_publish or zone_query_channel.
 #[no_mangle]
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {
