@@ -2,14 +2,15 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::time::Duration;
 use std::sync::OnceLock;
+use std::path::Path;
+use std::fs;
 
 use lb_core::mantle::ops::channel::ChannelId;
 use lb_key_management_system_service::keys::Ed25519Key;
-use logos_blockchain_zone_sdk::sequencer::ZoneSequencer;
+use logos_blockchain_zone_sdk::sequencer::{ZoneSequencer, SequencerCheckpoint};
 use reqwest::Url;
 use tokio::runtime::Runtime;
 
-// Global single-threaded tokio runtime, initialized once
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn get_runtime() -> &'static Runtime {
@@ -21,24 +22,40 @@ fn get_runtime() -> &'static Runtime {
     })
 }
 
+fn load_checkpoint(path: &str) -> Option<SequencerCheckpoint> {
+    if path.is_empty() { return None; }
+    let data = fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
+    if path.is_empty() { return; }
+    if let Ok(data) = serde_json::to_vec(checkpoint) {
+        let _ = fs::write(path, data);
+    }
+}
+
 /// Publish data to a zone channel via the blockchain node.
+///
+/// - node_url: HTTP endpoint e.g. "http://192.168.0.209:8080"
+/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed)
+/// - data: text to inscribe
+/// - checkpoint_path: file path to load/save checkpoint (pass "" to disable)
+///
+/// Returns heap-allocated hex inscription ID, or NULL on error.
+/// Caller must free with zone_free_string().
 #[no_mangle]
 pub extern "C" fn zone_publish(
     node_url: *const c_char,
     signing_key_hex: *const c_char,
     data: *const c_char,
+    checkpoint_path: *const c_char,
 ) -> *mut c_char {
-    let result = std::panic::catch_unwind(|| zone_publish_inner(node_url, signing_key_hex, data));
+    let result = std::panic::catch_unwind(|| zone_publish_inner(node_url, signing_key_hex, data, checkpoint_path));
     match result {
         Ok(Some(s)) => s.into_raw(),
-        Ok(None) => {
-            eprintln!("zone_publish: returned None");
-            std::ptr::null_mut()
-        }
-        Err(e) => {
-            eprintln!("zone_publish: panicked: {:?}", e);
-            std::ptr::null_mut()
-        }
+        Ok(None) => { eprintln!("zone_publish: returned None"); std::ptr::null_mut() }
+        Err(e) => { eprintln!("zone_publish: panicked: {:?}", e); std::ptr::null_mut() }
     }
 }
 
@@ -46,6 +63,7 @@ fn zone_publish_inner(
     node_url: *const c_char,
     signing_key_hex: *const c_char,
     data: *const c_char,
+    checkpoint_path: *const c_char,
 ) -> Option<CString> {
     if node_url.is_null() || signing_key_hex.is_null() || data.is_null() {
         eprintln!("zone_publish: null argument");
@@ -55,6 +73,9 @@ fn zone_publish_inner(
     let node_url_str = unsafe { CStr::from_ptr(node_url) }.to_str().ok()?;
     let signing_key_str = unsafe { CStr::from_ptr(signing_key_hex) }.to_str().ok()?;
     let data_str = unsafe { CStr::from_ptr(data) }.to_str().ok()?;
+    let ckpt_path = if checkpoint_path.is_null() { "" } else {
+        unsafe { CStr::from_ptr(checkpoint_path) }.to_str().unwrap_or("")
+    };
 
     let key_bytes: [u8; 32] = hex::decode(signing_key_str).ok()?.try_into().ok()?;
     let signing_key = Ed25519Key::from_bytes(&key_bytes);
@@ -62,18 +83,22 @@ fn zone_publish_inner(
     let channel_id = ChannelId::from(channel_bytes);
     let url: Url = node_url_str.parse().ok()?;
 
-    eprintln!("zone_publish: node={}, channel={}", url, hex::encode(channel_bytes));
-    // Write debug marker to confirm we got here
-    let _ = std::fs::write("/tmp/zone_publish_called.txt",
-        format!("called: node={} channel={}", url, hex::encode(channel_bytes)));
+    eprintln!("zone_publish: node={} channel={} checkpoint={}", url, hex::encode(channel_bytes), ckpt_path);
+
+    let checkpoint = load_checkpoint(ckpt_path);
+    if checkpoint.is_some() {
+        eprintln!("zone_publish: loaded checkpoint from {}", ckpt_path);
+    } else {
+        eprintln!("zone_publish: starting fresh (no checkpoint)");
+    }
 
     let data_bytes = data_str.as_bytes().to_vec();
     eprintln!("zone_publish: publishing {} bytes...", data_bytes.len());
 
     let rt = get_runtime();
 
-    let inscription_id = rt.block_on(async {
-        let sequencer = ZoneSequencer::init(channel_id, signing_key, url, None, None);
+    let result = rt.block_on(async {
+        let sequencer = ZoneSequencer::init(channel_id, signing_key, url, None, checkpoint);
 
         let mut attempts = 0;
         loop {
@@ -83,6 +108,9 @@ fn zone_publish_inner(
                     let id_bytes: [u8; 32] = result.inscription_id.into();
                     let id_hex = hex::encode(id_bytes);
                     eprintln!("zone_publish: inscription_id={}", id_hex);
+                    // Save checkpoint for next call
+                    save_checkpoint(ckpt_path, &result.checkpoint);
+                    eprintln!("zone_publish: checkpoint saved to {}", ckpt_path);
                     // Give sequencer actor time to post tx to node
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     return Some(id_hex);
@@ -99,10 +127,10 @@ fn zone_publish_inner(
         }
     })?;
 
-    CString::new(inscription_id).ok()
+    CString::new(result).ok()
 }
 
-/// Free a string returned by `zone_publish`.
+/// Free a string returned by zone_publish.
 #[no_mangle]
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {
