@@ -160,13 +160,28 @@ fn zone_query_channel_inner(
 
     let channel_id = ChannelId::from(<[u8; 32]>::try_from(hex::decode(channel_id_hex_str).ok()?).ok()?);
     let url: Url = node_url_str.parse().ok()?;
-    let indexer = ZoneIndexer::new(channel_id, url, None);
+    let url_for_indexer = url.clone();
+    let indexer = ZoneIndexer::new(channel_id, url_for_indexer, None);
 
     eprintln!("zone_query_channel: channel={} limit={}", channel_id_hex_str, limit);
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let poll = indexer.next_messages(None, limit as usize).await.ok()?;
+        // Get current chain tip to start from recent blocks only
+        // Scanning from genesis is too slow — start from (tip - lookback) instead
+        let http_client = lb_common_http_client::CommonHttpClient::new(None);
+        let start_cursor = if let Ok(info) = http_client.consensus_info(url.clone()).await {
+            let tip_slot: u64 = info.slot.into();
+            let lookback: u64 = 50000; // scan last 50k slots (~14 hours at 1s slots)
+            let start_slot = tip_slot.saturating_sub(lookback);
+            serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
+                    &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
+                ).ok()
+        } else {
+            None // fall back to genesis if we can't get tip
+        };
+
+        let poll = indexer.next_messages(start_cursor, limit as usize).await.ok()?;
         let items: Vec<serde_json::Value> = poll.messages.iter().map(|b| {
             serde_json::json!({
                 "id": hex::encode(<[u8; 32]>::from(b.id)),
