@@ -4659,6 +4659,7 @@ name = "zone-sequencer-rs"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "logos-blockchain-common-http-client",
  "logos-blockchain-core",
  "logos-blockchain-key-management-system-service",
  "logos-blockchain-zone-sdk",

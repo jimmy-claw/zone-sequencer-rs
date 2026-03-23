@@ -2,7 +2,6 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::time::Duration;
 use std::sync::OnceLock;
-use std::path::Path;
 use std::fs;
 
 use lb_core::mantle::ops::channel::ChannelId;
@@ -35,15 +34,15 @@ fn save_checkpoint(path: &str, checkpoint: &SequencerCheckpoint) {
     }
 }
 
-/// Publish data to a zone channel via the blockchain node.
+/// Publish data to a zone channel.
 ///
 /// - node_url: HTTP endpoint e.g. "http://192.168.0.209:8080"
-/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed)
+/// - signing_key_hex: 64-char hex (32-byte Ed25519 seed). Channel ID derived from public key.
 /// - data: text to inscribe
-/// - checkpoint_path: file path to load/save checkpoint (pass "" to disable)
+/// - checkpoint_path: file to load/save checkpoint ("" to disable). On first publish for a
+///   fresh channel, pass a path but it's fine if the file doesn't exist yet.
 ///
-/// Returns heap-allocated hex inscription ID, or NULL on error.
-/// Caller must free with zone_free_string().
+/// Returns heap-allocated hex inscription ID, or NULL on error. Free with zone_free_string().
 #[no_mangle]
 pub extern "C" fn zone_publish(
     node_url: *const c_char,
@@ -83,14 +82,10 @@ fn zone_publish_inner(
     let channel_id = ChannelId::from(channel_bytes);
     let url: Url = node_url_str.parse().ok()?;
 
-    eprintln!("zone_publish: node={} channel={} checkpoint={}", url, hex::encode(channel_bytes), ckpt_path);
-
     let checkpoint = load_checkpoint(ckpt_path);
-    if checkpoint.is_some() {
-        eprintln!("zone_publish: loaded checkpoint from {}", ckpt_path);
-    } else {
-        eprintln!("zone_publish: starting fresh (no checkpoint)");
-    }
+    eprintln!("zone_publish: node={} channel={} checkpoint={}",
+        url, hex::encode(channel_bytes),
+        if checkpoint.is_some() { "loaded" } else { "fresh" });
 
     let data_bytes = data_str.as_bytes().to_vec();
     eprintln!("zone_publish: publishing {} bytes...", data_bytes.len());
@@ -108,10 +103,7 @@ fn zone_publish_inner(
                     let id_bytes: [u8; 32] = result.inscription_id.into();
                     let id_hex = hex::encode(id_bytes);
                     eprintln!("zone_publish: inscription_id={}", id_hex);
-                    // Save checkpoint for next call
                     save_checkpoint(ckpt_path, &result.checkpoint);
-                    eprintln!("zone_publish: checkpoint saved to {}", ckpt_path);
-                    // Give sequencer actor time to post tx to node
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     return Some(id_hex);
                 }
