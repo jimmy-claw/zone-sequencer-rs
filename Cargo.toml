@@ -1,0 +1,15 @@
+[package]
+name = "zone-sequencer-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "808288cc2fceef435ec20d2e6ed0d26114d22f4c", package = "logos-blockchain-zone-sdk" }
+lb-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "808288cc2fceef435ec20d2e6ed0d26114d22f4c", package = "logos-blockchain-key-management-system-service" }
+lb-core = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "808288cc2fceef435ec20d2e6ed0d26114d22f4c", package = "logos-blockchain-core" }
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
